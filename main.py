@@ -23,11 +23,14 @@ class ResLayer(tf.keras.layers.Layer):
         return tf.add(res_input, x)
 
 
-def apply_concat(conv_input, concat_shape):
+def apply_concat(conv_input, concat_shape, reversed=False):
     current_shape = conv_input.shape.as_list()
     current_shape[1] = concat_shape
     to_concat = tf.zeros(current_shape)
-    conv_input = tf.concat([to_concat, conv_input], axis=1)
+    if not reversed:
+        conv_input = tf.concat([to_concat, conv_input], axis=1)
+    else:
+        conv_input = tf.concat([conv_input, to_concat], axis=1)
     return conv_input
 
 
@@ -79,7 +82,7 @@ class SoundStreamEncoder(tf.keras.models.Model):
         x = self.enc1(inputs)
         x = self.enc2(x)
         x = self.enc3(x)
-        x = apply_concat(x, 2)
+        x = apply_concat(x, 2, reversed=False)
         x = self.conv1(x)
         x = tf.nn.leaky_relu(x)
         x = apply_concat(x, 2)
@@ -169,6 +172,7 @@ def load_weights(model):
 
 def test_model(model):
     inter = tf.lite.Interpreter('./soundstream_encoder.tflite')
+    inter.allocate_tensors()
     tflite_model = inter.get_signature_runner()
     x = np.float32(np.random.random((1, 320)))
     res = tflite_model(input_audio=x)['output_0']
@@ -176,8 +180,10 @@ def test_model(model):
     my_res = model(x.reshape(1, 320, 1, 1))
 
     print(np.allclose(res, my_res))
-    # import ipdb;
-    # ipdb.set_trace(context=20)
+
+
+    import ipdb;
+    ipdb.set_trace(context=20)
 
 
 if __name__ == '__main__':
