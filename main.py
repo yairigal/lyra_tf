@@ -3,68 +3,73 @@ import tensorflow as tf
 keras = tf.keras
 from keras import models, layers
 import numpy as np
+import ipdb
 
 
 class ResLayer(tf.keras.layers.Layer):
-    def __init__(self, cin, cout, depth_dilation=1,last_conv_groups=1, **kwargs):
+    def __init__(self, cin, cout, depth_dilation=1, last_conv_groups=1, **kwargs):
         super().__init__(**kwargs)
         self.depthwise = layers.DepthwiseConv2D(kernel_size=(3, 1), dilation_rate=(depth_dilation, 1))
         self.pointwise = layers.Conv2D(filters=cin, kernel_size=(1, 1))
         self.leaky_relu = layers.LeakyReLU()
         self.last_conv = layers.Conv2D(filters=cout, kernel_size=(1, 1), groups=last_conv_groups)
 
-    def call(self, res_input, inputs, **kwargs):
-        x = inputs
-
-        x = self.depthwise(x)
+    def call(self, inputs, **kwargs):
+        x = self.depthwise(inputs)
         x = self.pointwise(x)
         x = self.leaky_relu(x)
         x = self.last_conv(x)
-        return tf.add(res_input, x)
-
-
-def apply_concat(conv_input, concat_shape, reversed=False):
-    current_shape = conv_input.shape.as_list()
-    current_shape[1] = concat_shape
-    to_concat = tf.zeros(current_shape)
-    if not reversed:
-        conv_input = tf.concat([to_concat, conv_input], axis=1)
-    else:
-        conv_input = tf.concat([conv_input, to_concat], axis=1)
-    return conv_input
+        return x
 
 
 class Encoder(tf.keras.layers.Layer):
-    def __init__(self, cin, first_kernel_size=10, first_stride=5, concat_shapes=(2, 6, 18), first_concat=5, first_conv_groups=1, last_conv_groups=1, **kwargs):
+    def __init__(self, cin, first_concat, first_kernel_size=10, first_stride=5, first_conv_groups=1, last_conv_groups=1, **kwargs):
         super().__init__(**kwargs)
         self.first_conv = layers.Conv2D(filters=cin, kernel_size=(first_kernel_size, 1), strides=(first_stride, 1), groups=first_conv_groups)
         self.res1 = ResLayer(cin=cin, cout=cin, depth_dilation=1, last_conv_groups=last_conv_groups)
         self.res2 = ResLayer(cin=cin, cout=cin, depth_dilation=3, last_conv_groups=last_conv_groups)
         self.res3 = ResLayer(cin=cin, cout=cin, depth_dilation=9, last_conv_groups=last_conv_groups)
-        self.concat_shapes = concat_shapes
         self.first_concat = first_concat
+        self.first_buffer = tf.zeros(first_concat)
+        self.res1_buffer = tf.zeros((1, 2, 1, cin))
+        self.res2_buffer = tf.zeros((1, 6, 1, cin))
+        self.res3_buffer = tf.zeros((1, 18, 1, cin))
+
+    @tf.function
+    def _causal_pad(self, x, buffer, size):
+        x = tf.concat([buffer, x], axis=1)
+        next_padding = x[:, -size:, :, :]
+        return x, next_padding
 
     def call(self, inputs, *args, **kwargs):
-        x = apply_concat(inputs, self.first_concat)
+        x, self.first_buffer = self._causal_pad(inputs, self.first_buffer, tf.constant(self.first_concat[1]))
+        # x = tf.concat([self.first_buffer, inputs], axis=1)
+        # d = tf.Variable([0, -48, 0, 0], dtype=tf.int32)
+        # e = tf.Variable([0, 0, 0, 1], dtype=tf.int32)
+        # abc = tf.strided_slice(x, d, e)
+        # self.first_buffer = x[:, tf.constant(-self.first_concat[1]):, :, :]
         res_inputs = self.first_conv(x)
         conv_input = tf.nn.leaky_relu(res_inputs)
 
-        conv_input = apply_concat(conv_input, self.concat_shapes[0])
+        conv_input = tf.concat([self.res1_buffer, conv_input], axis=1)
+        self.res1_buffer = conv_input[:, -2:, :, :]
 
-        x = self.res1(res_inputs, conv_input)
-        res_inputs = tf.add(x, res_inputs)
+        res_output = self.res1(conv_input)
+        res_inputs = tf.add(res_inputs, res_output)
         conv_input = tf.nn.leaky_relu(res_inputs)
 
-        conv_input = apply_concat(conv_input, self.concat_shapes[1])
+        conv_input = tf.concat([self.res2_buffer, conv_input], axis=1)
+        self.res2_buffer = conv_input[:, -6:, :, :]
 
-        x = self.res2(res_inputs, conv_input)
-        res_inputs = tf.add(x, res_inputs)
+        res_outputs = self.res2(conv_input)
+        res_inputs = tf.add(res_outputs, res_inputs)
         conv_input = tf.nn.leaky_relu(res_inputs)
 
-        conv_input = apply_concat(conv_input, self.concat_shapes[2])
+        conv_input = tf.concat([self.res3_buffer, conv_input], axis=1)
+        self.res3_buffer = conv_input[:, -18:, :, :]
 
-        x = self.res3(res_inputs, conv_input)
-        res_inputs = tf.add(x, res_inputs)
+        res_outputs = self.res3(conv_input)
+        res_inputs = tf.add(res_outputs, res_inputs)
         x = tf.nn.leaky_relu(res_inputs)
         return x
 
@@ -72,33 +77,48 @@ class Encoder(tf.keras.layers.Layer):
 class SoundStreamEncoder(tf.keras.models.Model):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.enc1 = Encoder(cin=64, first_kernel_size=64, first_stride=16, concat_shapes=[2, 6, 18], first_concat=48, last_conv_groups=1)
-        self.enc2 = Encoder(cin=128, first_kernel_size=10, first_stride=5, concat_shapes=[2, 6, 18], first_concat=5, last_conv_groups=2)
-        self.enc3 = Encoder(cin=256, first_kernel_size=4, first_stride=2, concat_shapes=[2, 6, 18], first_concat=2, last_conv_groups=4, first_conv_groups=2)
+        self.enc1 = Encoder(cin=64, first_kernel_size=64, first_stride=16, first_concat=(1, 48, 1, 1), last_conv_groups=1)
+        self.enc2 = Encoder(cin=128, first_kernel_size=10, first_stride=5, first_concat=(1, 5, 1, 64), last_conv_groups=2)
+        self.enc3 = Encoder(cin=256, first_kernel_size=4, first_stride=2, first_concat=(1, 2, 1, 128), last_conv_groups=4, first_conv_groups=2)
         self.conv1 = layers.Conv2D(filters=512, kernel_size=(4, 1), strides=(2, 1), groups=4)
         self.conv2 = layers.Conv2D(filters=64, kernel_size=(3, 1), groups=4)
+
+        self.first_buffer = tf.zeros((1, 2, 1, 256))
+        self.second_buffer = tf.zeros((1, 2, 1, 512))
 
     def call(self, inputs, training=None, mask=None):
         x = self.enc1(inputs)
         x = self.enc2(x)
         x = self.enc3(x)
-        x = apply_concat(x, 2, reversed=False)
+        x = tf.concat([self.first_buffer, x], axis=1)
+        self.first_buffer = x[:, -2:, :, :]
         x = self.conv1(x)
         x = tf.nn.leaky_relu(x)
-        x = apply_concat(x, 2)
+        x = tf.concat([self.second_buffer, x], axis=1)
+        self.second_buffer = x[:, -2:, :, :]
         x = self.conv2(x)
         x = tf.squeeze(x, 1)
         return x
 
-from itertools import permutations
-def try_set_weights(root_obj, weights, bias):
 
+# model = keras.models.Sequential([
+#     Encoder(cin=64, first_kernel_size=64, first_stride=16, concat_shapes=[2, 6, 18], first_concat=48, last_conv_groups=1),
+#     Encoder(cin=128, first_kernel_size=10, first_stride=5, concat_shapes=[2, 6, 18], first_concat=5, last_conv_groups=2),
+#     Encoder(cin=256, first_kernel_size=4, first_stride=2, concat_shapes=[2, 6, 18], first_concat=2, last_conv_groups=4, first_conv_groups=2),
+#     Concat(2),
+#     layers.Conv2D(filters=512, kernel_size=(4, 1), strides=(2, 1), groups=4),
+#     layers.LeakyReLU(),
+#     Concat(2),
+#     layers.Conv2D(filters=64, kernel_size=(3, 1), groups=4),
+# ])
+
+
+def try_set_weights(root_obj, weights, bias):
     root_obj.set_weights([
         weights.transpose((1, 2, 3, 0)),
         bias
     ])
     return
-
 
     transposes = [
         # (3, 2, 1, 0),
@@ -179,11 +199,11 @@ def test_model(model):
 
     my_res = model(x.reshape(1, 320, 1, 1))
 
+    print(my_res)
+    print(res)
     print(np.allclose(res, my_res))
-
-
-    import ipdb;
-    ipdb.set_trace(context=20)
+    # import ipdb;
+    # ipdb.set_trace(context=20)
 
 
 if __name__ == '__main__':
@@ -200,9 +220,16 @@ if __name__ == '__main__':
     model.build([1, 320, 1, 1])
     # model.summary()
     res = model(tf.zeros([1, 320, 1, 1]))
+    ipdb.set_trace(context=20)
 
     model = load_weights(model)
+    tflitemodel = tf.lite.TFLiteConverter.from_keras_model(model)
+    tflitemodel = tflitemodel.convert()
+    with open('my_model.tflite', 'wb') as f:
+        f.write(tflitemodel)
+    # print(tflitemodel)
 
+    # tf.keras.models.save_model(model, './my_model.tf', save_format='keras')
     test_model(model)
 
     # model = SoundstreamEncoder
